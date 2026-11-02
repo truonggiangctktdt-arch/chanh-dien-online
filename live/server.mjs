@@ -6,6 +6,7 @@
 //   cd live && npm install && node server.mjs        → http://localhost:3000/live/control.html
 //
 import http from 'node:http';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -245,18 +246,54 @@ function setBots(on, n, pace){
 }
 
 /* -------------------------------------------------------------- server */
-// Security notes (this file is meant to be shared publicly):
-//  • listens on 127.0.0.1 only; nothing is reachable from the LAN or internet unless HOST is changed on purpose
-//  • Host header must be localhost/127.0.0.1 (blocks DNS-rebinding pages from talking to the server)
-//  • WebSocket only accepts pages served by this server (Origin check), so other sites open in the
-//    same browser cannot send control commands
-//  • static files: only /assets and /live, no dot-files, no node_modules, no server source, no path escapes
-//  • no TikTok password, cookie or session is ever used or stored; only public room events are read
+// Render: set ADMIN_PASSWORD as a secret environment variable. Never commit it.
+// HTTP Basic Auth protects the admin page; successful login creates an HttpOnly
+// cookie used to authorize control WebSocket connections in the same browser.
 const HOST = process.env.HOST || '127.0.0.1';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+if (ADMIN_PASSWORD.length < 16) {
+  console.error('ADMIN_PASSWORD must be set to a strong password of at least 16 characters.');
+  process.exit(1);
+}
+const SESSION = randomBytes(32).toString('hex'); // changes on every server restart
+const COOKIE_NAME = 'chanhdien_admin';
 const MIME = { '.html':'text/html; charset=utf-8', '.js':'text/javascript', '.css':'text/css', '.json':'application/json',
   '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.mp3':'audio/mpeg', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
 const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
+if (process.env.RENDER_EXTERNAL_HOSTNAME) ALLOWED_HOSTS.add(process.env.RENDER_EXTERNAL_HOSTNAME.toLowerCase());
+if (process.env.PUBLIC_HOSTNAME) ALLOWED_HOSTS.add(process.env.PUBLIC_HOSTNAME.toLowerCase());
 const okHost = h => ALLOWED_HOSTS.has(String(h || '').toLowerCase());
+const same = (a, b) => {
+  const x = Buffer.from(String(a)); const y = Buffer.from(String(b));
+  return x.length === y.length && timingSafeEqual(x, y);
+};
+function hasSession(req) {
+  const cookies = String(req.headers.cookie || '').split(';').map(x => x.trim());
+  const token = cookies.find(x => x.startsWith(COOKIE_NAME + '='))?.slice(COOKIE_NAME.length + 1);
+  return !!token && same(token, SESSION);
+}
+function validBasic(req) {
+  const h = String(req.headers.authorization || '');
+  if (!h.startsWith('Basic ')) return false;
+  try {
+    const raw = Buffer.from(h.slice(6), 'base64').toString('utf8');
+    const i = raw.indexOf(':');
+    return i >= 0 && same(raw.slice(0, i), 'admin') && same(raw.slice(i + 1), ADMIN_PASSWORD);
+  } catch { return false; }
+}
+function cookieHeader(req) {
+  const https = req.headers['x-forwarded-proto'] === 'https';
+  return `${COOKIE_NAME}=${SESSION}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${https ? '; Secure' : ''}`;
+}
+function sameOrigin(req, origin) {
+  if (!origin) return true; // non-browser overlay clients; never grants control rights
+  try {
+    const u = new URL(origin);
+    const secure = req.headers['x-forwarded-proto'] === 'https';
+    return u.host.toLowerCase() === String(req.headers.host || '').toLowerCase()
+      && u.protocol === (secure ? 'https:' : 'http:');
+  } catch { return false; }
+}
 const SEP = path.sep;
 function resolveStatic(urlPath){
   let p = urlPath === '/' ? '/live/control.html' : urlPath;
@@ -271,21 +308,31 @@ const server = http.createServer((req, res) => {
   if (!okHost(req.headers.host)) { res.writeHead(421).end('wrong host'); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405).end(); return; }
   let p; try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
+  const isAdmin = p === '/' || p === '/live/control.html';
+  let setCookie;
+  if (isAdmin && !hasSession(req)) {
+    if (!validBasic(req)) {
+      res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Chanh Dien Admin"',
+        'Cache-Control': 'no-store' }).end('Authentication required');
+      return;
+    }
+    setCookie = cookieHeader(req);
+  }
   const file = resolveStatic(p);
   if (!file) { res.writeHead(404).end('not found'); return; }
   fs.stat(file, (err, st) => {
     if (err || !st.isFile()) { res.writeHead(404).end('not found'); return; }
     res.writeHead(200, { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
-      'Cache-Control': p.startsWith('/live/tts/') ? 'no-store' : 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' });
+      'Cache-Control': isAdmin || p.startsWith('/live/tts/') ? 'no-store' : 'no-cache', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', ...(setCookie ? { 'Set-Cookie': setCookie } : {}) });
     if (req.method === 'HEAD') { res.end(); return; }
     fs.createReadStream(file).pipe(res);
   });
 });
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024,
   verifyClient: ({ origin, req }) => {
-    if (!okHost(req.headers.host)) return false;
-    if (!origin) return true;                                   // OBS / non-browser clients send no Origin
-    try { return okHost(new URL(origin).host); } catch { return false; }
+    if (!okHost(req.headers.host) || !sameOrigin(req, origin)) return false;
+    const role = new URL(req.url, 'http://x').searchParams.get('role');
+    return role !== 'control' || hasSession(req);
   } });
 function broadcast(msg, only){ const s = JSON.stringify(msg); for (const c of wss.clients) if (c.readyState === 1 && (!only || c.role === only)) c.send(s); }
 wss.on('connection', (ws, req) => {
@@ -297,4 +344,4 @@ wss.on('connection', (ws, req) => {
     try { const m = JSON.parse(buf); if (m && m.t === 'ctl') onControl(m); } catch (e) { addLog('Lệnh lỗi: ' + e.message); }
   });
 });
-server.listen(PORT, HOST, () => addLog(`Server chạy tại http://localhost:${PORT}  ·  Bảng điều khiển: http://localhost:${PORT}/live/control.html  ·  Overlay: http://localhost:${PORT}/live/overlay.html`));
+server.listen(PORT, HOST, () => addLog(`Server listening on ${HOST}:${PORT}; admin: /live/control.html; overlay: /live/overlay.html`));
