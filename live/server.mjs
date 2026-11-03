@@ -76,7 +76,7 @@ function seat(id, name, opts = {}){
 }
 
 /* ------------------------------------------------------------- events in */
-function onChat(id, name, text, avatar){
+function onchat(id, name, text, avatar){
   text = String(text || '').slice(0, 120);
   const want = skinFromText(text);
   const { v, isNew } = seat(id, name, { avatar, skin: want || undefined });
